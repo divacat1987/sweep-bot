@@ -274,9 +274,25 @@ class TradeFlowAnalyzer:
             if self._absorption_mean > 0 and b.total_qty / self._absorption_mean < threshold
         )
         if dry_count >= 5:
+            # 耗竭確認前：檢查當前價格是否在 OTE 0.618~0.786
+            # 先判斷方向（靠近哪面牆）
+            mid   = bar.close
+            upper = self.active_upper_wall
+            lower = self.active_lower_wall
+            near_upper = upper and abs(mid - upper[0]) / mid < 0.005
+            trade_side = "SHORT" if near_upper else "LONG"
+
+            in_ote, ote_reason = self.km.is_in_ote(bar.close, trade_side, zone="ote")
+            if not in_ote:
+                logger.info(f"[{self.symbol}] Exhaustion: not in OTE, reset. {ote_reason}")
+                self._reset()
+                return
+
             self._exhaustion_mean_vol  = np.mean([b.total_qty for b in self.exhaustion_bars])
             self._exhaustion_mean_move = np.mean([b.price_move for b in self.exhaustion_bars])
             self.state = BotState.SWEEP_WATCH
+            logger.info(f"[{self.symbol}] EXHAUSTION → SWEEP_WATCH {ote_reason}")
+
         if len(self.exhaustion_bars) > self.cfg["exhaustion_window_sec"] * 5:
             self._reset()
 
@@ -293,6 +309,15 @@ class TradeFlowAnalyzer:
             if upper and bar.high >= upper[0]:  self.sweep_direction = "UP"
             elif lower and bar.low <= lower[0]: self.sweep_direction = "DOWN"
             else: self.sweep_direction = "UP" if bar.close > bar.open else "DOWN"
+
+            # 掃蕩確認：檢查價格是否在 0.618~1.0 之間（寬鬆）
+            trade_side = "SHORT" if self.sweep_direction == "UP" else "LONG"
+            in_sweep, sweep_reason = self.km.is_in_ote(bar.close, trade_side, zone="sweep")
+            if not in_sweep:
+                logger.info(f"[{self.symbol}] Sweep: not in sweep zone, reset. {sweep_reason}")
+                self._reset()
+                return
+
             self.sweep_bars         = [bar]
             self.apex_delta_history = [abs(bar.delta)]
             self.state              = BotState.APEX_WATCH
@@ -301,6 +326,7 @@ class TradeFlowAnalyzer:
                 f"🚨 <b>[{self.symbol}] 掃蕩觸發！</b>\n"
                 f"方向：{dcn}\n突破價：{bar.close:.4f}\n"
                 f"量倍數：{bar.total_qty / self._exhaustion_mean_vol:.1f}x\n"
+                f"Fib 位置：{sweep_reason}\n"
                 f"時間：{_fmt_time(bar.timestamp)}"
             )
 
@@ -371,29 +397,6 @@ class TradeFlowAnalyzer:
                 f"⚠️ <b>[{self.symbol}] 跳過進場</b>\n"
                 f"預期淨利不足：{expected_net:.2f} USDT（最低 1.5 USDT）"
             )
-            self._reset(); return
-
-        # ── OTE 過濾：進場價必須在 5m 結構的 Fib 0.618~0.786 區間內 ──
-        in_ote, ote_reason = self.km.is_in_ote(ep, side)
-        if not in_ote:
-            ote_levels = self.km.get_ote_levels()
-            ote_info = ""
-            if ote_levels:
-                dir_cn = "多頭" if ote_levels["direction"] == 2 else "空頭" if ote_levels["direction"] == 1 else "未定義"
-                ote_info = (
-                    f"結構方向：{dir_cn}\n"
-                    f"結構高：{ote_levels['high']:.4f}\n"
-                    f"結構低：{ote_levels['low']:.4f}\n"
-                    f"OTE 區間：{min(ote_levels['fib_0618'], ote_levels['fib_0786']):.4f}"
-                    f" ~ {max(ote_levels['fib_0618'], ote_levels['fib_0786']):.4f}"
-                )
-            await self.notifier.send(
-                f"⚠️ <b>[{self.symbol}] 跳過進場（不在 OTE）</b>\n"
-                f"進場價：{ep:.4f}\n"
-                f"{ote_reason}\n"
-                f"{ote_info}"
-            )
-            logger.info(f"[{self.symbol}] OTE filter: {ote_reason}")
             self._reset(); return
 
         await self.semaphore.acquire()
