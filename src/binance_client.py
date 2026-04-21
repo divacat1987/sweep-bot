@@ -125,6 +125,8 @@ class BinanceClient:
             "type":          "STOP_MARKET",
             "stopPrice":     round(stop_price, 6),
             "closePosition": "true" if close_position else "false",
+            "workingType":   "CONTRACT_PRICE",
+            "priceProtect":  "FALSE",
         }
         if not close_position:
             params["quantity"] = quantity
@@ -147,6 +149,8 @@ class BinanceClient:
             "type":          "TAKE_PROFIT_MARKET",
             "stopPrice":     round(stop_price, 6),
             "closePosition": "true" if close_position else "false",
+            "workingType":   "CONTRACT_PRICE",
+            "priceProtect":  "FALSE",
         }
         result = await self._request("POST", "/fapi/v1/order", params)
         if result:
