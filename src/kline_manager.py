@@ -52,27 +52,32 @@ class SMCStructure:
 class KlineManager:
     """
     Maintains a rolling window of 5-minute closed klines via WebSocket.
-    Computes SMC Current Structure and OTE Fibonacci levels on each close.
+    Computes SMC Current Structure using STRUCT_LOOKBACK=12 bars (= 1 hour).
+    Fib levels match Pine Script exactly:
+      Fibo1 = 0.786, Fibo3 = 0.618
+      OTE zone = 0.618 ~ 0.786
 
-    OTE zone = Fib 0.618 ~ 0.786 of the current structure swing.
+    Pine Script formula:
+      direction=1 (bearish): fib = high - (range - range * fiboValue)
+      direction=2 (bullish): fib = low  + (range - range * fiboValue)
 
-    For a BEARISH structure (direction=1, high→low swing):
-        fib_0618 = high - range * (1 - 0.618)  ← lower boundary
-        fib_0786 = high - range * (1 - 0.786)  ← upper boundary
-        Entry is in OTE if: fib_0618 <= price <= fib_0786
+    For BEARISH structure (direction=1):
+        fib_0786 = high - range*(1-0.786)  ← upper OTE boundary
+        fib_0618 = high - range*(1-0.618)  ← lower OTE boundary
+        SHORT entry is in OTE if: fib_0618 <= price <= fib_0786
 
-    For a BULLISH structure (direction=2, low→high swing):
-        fib_0618 = low + range * (1 - 0.618)   ← upper boundary
-        fib_0786 = low + range * (1 - 0.786)   ← lower boundary
-        Entry is in OTE if: fib_0786 <= price <= fib_0618
+    For BULLISH structure (direction=2):
+        fib_0786 = low + range*(1-0.786)   ← lower OTE boundary
+        fib_0618 = low + range*(1-0.618)   ← upper OTE boundary
+        LONG entry is in OTE if: fib_0786 <= price <= fib_0618
     """
 
     REST_URL = "https://fapi.binance.com/fapi/v1/klines"
     WS_URL   = "wss://fstream.binance.com/ws"
 
-    INTERVAL     = "5m"
-    LOOKBACK     = 100   # bars to maintain
-    STRUCT_LOOKBACK = 10  # bars for structure high/low detection
+    INTERVAL        = "5m"
+    LOOKBACK        = 100   # bars to maintain
+    STRUCT_LOOKBACK = 12    # 12 根 5m K = 1 小時結構
 
     def __init__(self, symbol: str):
         self.symbol   = symbol.upper()
@@ -185,16 +190,25 @@ class KlineManager:
         if s_range == 0:
             return
 
+        # Pine Script 公式：
+        # 空頭(direction=1): fib = high - (range - range * fiboValue)
+        # 多頭(direction=2): fib = low  + (range - range * fiboValue)
+        # Fibo1 = 0.786, Fibo3 = 0.618
+        # OTE 區間 = 0.618 ~ 0.786
+
+        FIBO_786 = 0.786
+        FIBO_618 = 0.618
+
         if direction == 2:
-            # Bullish: fib from low up to high, retracement zone
-            fib_0618 = s_low + s_range * (1 - 0.618)   # 0.382 level from low
-            fib_0786 = s_low + s_range * (1 - 0.786)   # 0.214 level from low
-            fib_1000 = s_low                             # 1.0 = the low itself
+            # 多頭結構：從低點往上拉伸，回撤到 0.618~0.786 是 OTE
+            fib_0786 = s_low + (s_range - s_range * FIBO_786)   # 較低
+            fib_0618 = s_low + (s_range - s_range * FIBO_618)   # 較高
+            fib_1000 = s_low                                      # 1.0 = 低點
         else:
-            # Bearish: fib from high down to low, retracement zone
-            fib_0618 = s_high - s_range * (1 - 0.618)  # 0.382 level from high
-            fib_0786 = s_high - s_range * (1 - 0.786)  # 0.214 level from high
-            fib_1000 = s_high                            # 1.0 = the high itself
+            # 空頭結構：從高點往下拉伸，反彈到 0.618~0.786 是 OTE
+            fib_0786 = s_high - (s_range - s_range * FIBO_786)  # 較高
+            fib_0618 = s_high - (s_range - s_range * FIBO_618)  # 較低
+            fib_1000 = s_high                                     # 1.0 = 高點
 
         self.structure = SMCStructure(
             direction      = direction,
@@ -208,51 +222,39 @@ class KlineManager:
     # ------------------------------------------------------------------ #
     #  OTE filter                                                           #
     # ------------------------------------------------------------------ #
+    #  OTE filter                                                           #
+    # ------------------------------------------------------------------ #
 
-    def is_in_ote(self, price: float, trade_side: str) -> Tuple[bool, str]:
+    def is_in_ote(self, price: float, trade_side: str,
+                  zone: str = "ote") -> Tuple[bool, str]:
         """
-        Check if price is within OTE zone (Fib 0.618 ~ 0.786).
-
+        zone = "ote"   → 0.618 ~ 0.786（耗竭期用，嚴格）
+        zone = "sweep" → 0.618 ~ 1.0  （掃蕩期用，寬鬆）
         trade_side: "LONG" or "SHORT"
-
-        For SHORT (bearish retracement into OTE):
-            Structure should be bearish (direction=1) or neutral
-            Price should be in upper retracement zone (near 0.618~0.786 from high)
-
-        For LONG (bullish retracement into OTE):
-            Structure should be bullish (direction=2) or neutral
-            Price should be in lower retracement zone (near 0.618~0.786 from low)
-
-        Returns (is_in_ote, reason_string)
         """
         if self.structure is None:
             return False, "No structure data yet"
 
         s = self.structure
 
-        if trade_side == "SHORT":
-            # bearish OTE: price pulled back up into 0.618~0.786 from high
+        if zone == "sweep":
+            # 寬鬆區間：0.618 ~ 1.0（Fib 1.0 = 結構高/低點）
+            if trade_side == "SHORT":
+                lo = min(s.fib_0618, s.fib_1000)
+                hi = max(s.fib_0618, s.fib_1000)
+            else:
+                lo = min(s.fib_0618, s.fib_1000)
+                hi = max(s.fib_0618, s.fib_1000)
+            in_zone = lo <= price <= hi
+            label   = f"SWEEP [{lo:.4f}~{hi:.4f}] price={price:.4f} {'✅' if in_zone else '❌'}"
+            return in_zone, label
+        else:
+            # 嚴格 OTE：0.618 ~ 0.786
             lo = min(s.fib_0618, s.fib_0786)
             hi = max(s.fib_0618, s.fib_0786)
             in_zone = lo <= price <= hi
-            reason = (
-                f"SHORT OTE [{lo:.4f} ~ {hi:.4f}] "
-                f"price={price:.4f} "
-                f"{'✅' if in_zone else '❌'}"
-            )
-            return in_zone, reason
-
-        else:  # LONG
-            # bullish OTE: price pulled back down into 0.618~0.786 from low
-            lo = min(s.fib_0618, s.fib_0786)
-            hi = max(s.fib_0618, s.fib_0786)
-            in_zone = lo <= price <= hi
-            reason = (
-                f"LONG OTE [{lo:.4f} ~ {hi:.4f}] "
-                f"price={price:.4f} "
-                f"{'✅' if in_zone else '❌'}"
-            )
-            return in_zone, reason
+            label   = f"OTE [{lo:.4f}~{hi:.4f}] price={price:.4f} {'✅' if in_zone else '❌'}"
+            return in_zone, label
 
     def get_ote_levels(self) -> Optional[dict]:
         """Return current OTE levels for display."""
